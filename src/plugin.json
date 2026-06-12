@@ -1,0 +1,10 @@
+{
+  "publisher": "github.DevinSanders",
+  "id": "bridge.discord",
+  "name": "Discord Bridge",
+  "version": "1.0.0",
+  "author": "Devin Sanders",
+  "description": "Streams the master mix into a Discord voice channel. Requires codec.opus to be installed (Opus encoding is borrowed from there rather than bundling a second copy). Supports DAVE end-to-end voice encryption.",
+  "entryDll": "DiscordBridgePlugin.dll",
+  "isTheme": false
+}

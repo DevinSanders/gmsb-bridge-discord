@@ -1,0 +1,82 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>DiscordBridgePlugin</AssemblyName>
+    <RootNamespace>DiscordBridgePlugin</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <!-- Default for local dev builds. CI release.yml overrides via
+         `-p:Version=<tag-derived>`; PluginVersion.OfAssembly reads it
+         at runtime. Keep in sync with plugin.json for local builds. -->
+    <Version>1.0.0</Version>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The test project drives internal seams (ConfigureOutboundForTest)
+         and asserts internal framing constants (OpusFrameSamplesStereo /
+         Channels). Compile-time only — no effect on the shipped zip. -->
+    <InternalsVisibleTo Include="DiscordBridgePlugin.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Host provides SoundBoard.PluginApi at runtime (PluginLoadContext
+         defers to the default ALC), so ExcludeAssets="runtime" keeps the
+         compile reference but strips it from the plugin's output. -->
+    <PackageReference Include="SoundBoard.PluginApi" Version="1.0.0-beta.1" ExcludeAssets="runtime" />
+
+    <!-- NAudio.Core flows in transitively through SoundBoard.PluginApi. Same
+         exclude-runtime pattern as the codec plugins: compile against the
+         host's contract type but don't ship our own copy (the host owns
+         the live instance; two copies → split type identity). -->
+    <PackageReference Include="NAudio.Core" Version="2.3.0" ExcludeAssets="runtime" />
+
+    <!-- Avalonia is required at compile time for CreateSettingsControl()
+         (which hands the host an Avalonia Control). Same exclude-runtime
+         pattern as the sampler / theme plugins. -->
+    <PackageReference Include="Avalonia" Version="12.0.4" ExcludeAssets="runtime" />
+
+    <!-- The Discord.Net family + libdave native libs. THESE DO SHIP with
+         the plugin — that's the whole point of the bridge being a
+         separate plugin: users who don't run a Discord bot don't pay
+         for these ~25 MB of natives. libdave's MSBuild targets place
+         per-RID native binaries under runtimes/<rid>/native/ in the
+         publish output; the .NET native loader picks the right one at
+         runtime. -->
+    <PackageReference Include="Discord.Net" Version="3.19.1" />
+    <PackageReference Include="Discord.Net.Dave" Version="3.19.1" />
+    <PackageReference Include="libdave" Version="1.1.1.7" />
+
+    <!-- Native libopus + libsodium are required by Discord.Net's voice
+         subsystem REGARDLESS of whether we use the pre-encoded
+         CreateOpusStream() path. Discord.Net loads libopus for inbound
+         audio decoding and parts of the voice handshake; libsodium
+         provides the legacy-protocol packet authentication AND the
+         elliptic-curve primitives DAVE/MLS relies on under the hood.
+         Without these, the voice gateway aborts with
+         "opus couldn't be found" / "libsodium couldn't be found" and
+         the bot drops out of the channel a few seconds after joining.
+
+         These ship the native shared libraries (.dll / .so / .dylib)
+         per-RID under `runtimes/<rid>/native/`. The host's
+         PluginLoadContext.ProbeRuntimesNative fallback finds them when
+         the deps.json-driven resolver misses (which it does for
+         OpusSharp.Natives + libsodium because their build targets
+         deploy via `<Content>` rather than `<NativeLibraryDependency>`). -->
+    <PackageReference Include="OpusSharp.Natives" Version="1.6.1.3" />
+    <PackageReference Include="libsodium" Version="1.0.22" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- plugin.json is the host's install / discovery manifest. Must end
+         up next to the plugin DLL in the build output so the packaging
+         script (and any zip the user makes from that output) finds it
+         at the plugin folder root. -->
+    <None Update="plugin.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>
