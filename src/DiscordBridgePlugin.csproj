@@ -65,7 +65,7 @@
          the deps.json-driven resolver misses (which it does for
          OpusSharp.Natives + libsodium because their build targets
          deploy via `<Content>` rather than `<NativeLibraryDependency>`). -->
-    <PackageReference Include="OpusSharp.Natives" Version="1.6.1.3" />
+    <PackageReference Include="OpusSharp.Natives" Version="1.6.1.4" />
     <PackageReference Include="libsodium" Version="1.0.22" />
   </ItemGroup>
 
