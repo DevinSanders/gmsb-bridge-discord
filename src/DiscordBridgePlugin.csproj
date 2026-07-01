@@ -36,7 +36,7 @@
     <!-- Avalonia is required at compile time for CreateSettingsControl()
          (which hands the host an Avalonia Control). Same exclude-runtime
          pattern as the sampler / theme plugins. -->
-    <PackageReference Include="Avalonia" Version="12.0.4" ExcludeAssets="runtime" />
+    <PackageReference Include="Avalonia" Version="12.0.5" ExcludeAssets="runtime" />
 
     <!-- The Discord.Net family + libdave native libs. THESE DO SHIP with
          the plugin — that's the whole point of the bridge being a
@@ -45,8 +45,8 @@
          per-RID native binaries under runtimes/<rid>/native/ in the
          publish output; the .NET native loader picks the right one at
          runtime. -->
-    <PackageReference Include="Discord.Net" Version="3.19.1" />
-    <PackageReference Include="Discord.Net.Dave" Version="3.19.1" />
+    <PackageReference Include="Discord.Net" Version="3.20.1" />
+    <PackageReference Include="Discord.Net.Dave" Version="3.20.1" />
     <PackageReference Include="libdave" Version="1.1.1.7" />
 
     <!-- Native libopus + libsodium are required by Discord.Net's voice
@@ -65,7 +65,7 @@
          the deps.json-driven resolver misses (which it does for
          OpusSharp.Natives + libsodium because their build targets
          deploy via `<Content>` rather than `<NativeLibraryDependency>`). -->
-    <PackageReference Include="OpusSharp.Natives" Version="1.6.1.3" />
+    <PackageReference Include="OpusSharp.Natives" Version="1.6.1.4" />
     <PackageReference Include="libsodium" Version="1.0.22" />
   </ItemGroup>
 
