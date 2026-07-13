@@ -36,7 +36,7 @@
     <!-- Avalonia is required at compile time for CreateSettingsControl()
          (which hands the host an Avalonia Control). Same exclude-runtime
          pattern as the sampler / theme plugins. -->
-    <PackageReference Include="Avalonia" Version="12.0.5" ExcludeAssets="runtime" />
+    <PackageReference Include="Avalonia" Version="12.1.0" ExcludeAssets="runtime" />
 
     <!-- The Discord.Net family + libdave native libs. THESE DO SHIP with
          the plugin — that's the whole point of the bridge being a
