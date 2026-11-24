@@ -211,3 +211,357 @@ public class OutboundFramingTests
         (encoder.FrameSamples * Bridge.Channels).Should().Be(Bridge.OpusFrameSamplesStereo);
     }
 }
+
+public class SelfHealingTests
+{
+    private static Bridge NewFastRecoveryBridge()
+    {
+        var plugin = new Bridge
+        {
+            WriteTimeout = TimeSpan.FromMilliseconds(50),
+            FlushTimeout = TimeSpan.FromMilliseconds(50),
+            RebuildEscalationWindow = TimeSpan.FromSeconds(10),
+            GatewayWaitTimeout = TimeSpan.FromSeconds(2),
+            ReconnectBackoffs = new[]
+            {
+                TimeSpan.FromMilliseconds(10),
+                TimeSpan.FromMilliseconds(10),
+                TimeSpan.FromMilliseconds(10),
+            },
+        };
+        return plugin;
+    }
+
+    [Fact]
+    public async Task Write_timeout_does_not_deadlock_and_rebuilds_stream_in_place()
+    {
+        var encoder = new FakeFrameEncoder { FrameSamples = 960, Channels = 2, PacketBytes = 12 };
+        using var deadStream = new HangingWriteStream();
+        using var healthyStream = new MemoryStream();
+
+        int rebuildCalls = 0;
+        int rejoinCalls = 0;
+
+        var plugin = NewFastRecoveryBridge();
+        plugin.ConfigureRecoveryForTest(
+            rebuildStreamAsync: _ =>
+            {
+                rebuildCalls++;
+                return Task.FromResult<Stream?>(healthyStream);
+            },
+            rejoinVoiceAsync: _ =>
+            {
+                rejoinCalls++;
+                return Task.FromResult<Stream>(healthyStream);
+            });
+        plugin.ConfigureOutboundForTest(encoder, deadStream);
+
+        // Sending one frame hits the hanging stream, times out after ~50ms
+        // instead of deadlocking forever, and triggers Level 1 in-place rebuild.
+        plugin.SendOutboundPcm(new float[Bridge.OpusFrameSamplesStereo]);
+        await plugin.WaitForRecoveryIdleForTestAsync();
+
+        rebuildCalls.Should().Be(1);
+        rejoinCalls.Should().Be(0);
+        plugin.Status.Should().Be(BridgeStatus.Connected);
+        plugin.WantsOutboundAudio.Should().BeTrue();
+
+        // Audio now flows into the replacement stream.
+        plugin.SendOutboundPcm(new float[Bridge.OpusFrameSamplesStereo * 2]);
+        healthyStream.Length.Should().Be(2 * encoder.PacketBytes);
+    }
+
+    [Fact]
+    public async Task Repeated_stream_stalls_escalate_from_rebuild_to_full_voice_rejoin()
+    {
+        var encoder = new FakeFrameEncoder { FrameSamples = 960, Channels = 2, PacketBytes = 10 };
+        using var firstDead = new HangingWriteStream();
+        using var secondDead = new HangingWriteStream();
+        using var healedStream = new MemoryStream();
+
+        int rebuildCalls = 0;
+        int rejoinCalls = 0;
+
+        var plugin = NewFastRecoveryBridge();
+        plugin.ConfigureRecoveryForTest(
+            rebuildStreamAsync: _ =>
+            {
+                rebuildCalls++;
+                // Return a stream that also stalls (e.g. wedged DAVE session).
+                return Task.FromResult<Stream?>(secondDead);
+            },
+            rejoinVoiceAsync: _ =>
+            {
+                rejoinCalls++;
+                return Task.FromResult<Stream>(healedStream);
+            });
+        plugin.ConfigureOutboundForTest(encoder, firstDead);
+
+        // First stall → Level 1 in-place stream rebuild.
+        plugin.SendOutboundPcm(new float[Bridge.OpusFrameSamplesStereo]);
+        await plugin.WaitForRecoveryIdleForTestAsync();
+        rebuildCalls.Should().Be(1);
+        rejoinCalls.Should().Be(0);
+
+        // Second stall within RebuildEscalationWindow → escalates to Level 2 full voice rejoin.
+        plugin.SendOutboundPcm(new float[Bridge.OpusFrameSamplesStereo]);
+        await plugin.WaitForRecoveryIdleForTestAsync();
+        rebuildCalls.Should().Be(1);
+        rejoinCalls.Should().Be(1);
+        plugin.Status.Should().Be(BridgeStatus.Connected);
+        plugin.WantsOutboundAudio.Should().BeTrue();
+
+        // Subsequent frames stream cleanly to the rejoined voice stream.
+        plugin.SendOutboundPcm(new float[Bridge.OpusFrameSamplesStereo]);
+        healedStream.Length.Should().Be(encoder.PacketBytes);
+    }
+
+    [Fact]
+    public async Task External_stream_cancellation_escalates_directly_to_voice_rejoin()
+    {
+        var encoder = new FakeFrameEncoder { FrameSamples = 960, Channels = 2, PacketBytes = 8 };
+        using var cancelledStream = new ExternallyCancelledStream();
+        using var healedStream = new MemoryStream();
+
+        int rebuildCalls = 0;
+        int rejoinCalls = 0;
+
+        var plugin = NewFastRecoveryBridge();
+        plugin.ConfigureRecoveryForTest(
+            rebuildStreamAsync: _ =>
+            {
+                rebuildCalls++;
+                return Task.FromResult<Stream?>(healedStream);
+            },
+            rejoinVoiceAsync: _ =>
+            {
+                rejoinCalls++;
+                return Task.FromResult<Stream>(healedStream);
+            });
+        plugin.ConfigureOutboundForTest(encoder, cancelledStream);
+
+        // Discord.Net's _connection.CancelToken cancelled the stream — must NOT
+        // silently swallow the OCE or trust Discord.Net's broken voice Resume.
+        plugin.SendOutboundPcm(new float[Bridge.OpusFrameSamplesStereo]);
+        await plugin.WaitForRecoveryIdleForTestAsync();
+
+        rebuildCalls.Should().Be(0);
+        rejoinCalls.Should().Be(1);
+        plugin.Status.Should().Be(BridgeStatus.Connected);
+        plugin.WantsOutboundAudio.Should().BeTrue();
+
+        plugin.SendOutboundPcm(new float[Bridge.OpusFrameSamplesStereo]);
+        healedStream.Length.Should().Be(encoder.PacketBytes);
+    }
+
+    [Fact]
+    public async Task Audio_client_disconnect_event_rejoins_and_restores_audio()
+    {
+        var encoder = new FakeFrameEncoder { FrameSamples = 960, Channels = 2, PacketBytes = 8 };
+        using var initialStream = new MemoryStream();
+        using var rejoinedStream = new MemoryStream();
+
+        var observedStatuses = new List<BridgeStatus>();
+        int rejoinCalls = 0;
+
+        var plugin = NewFastRecoveryBridge();
+        plugin.StatusChanged += (_, _) => observedStatuses.Add(plugin.Status);
+        plugin.ConfigureRecoveryForTest(
+            rejoinVoiceAsync: _ =>
+            {
+                rejoinCalls++;
+                return Task.FromResult<Stream>(rejoinedStream);
+            });
+        plugin.ConfigureOutboundForTest(encoder, initialStream);
+        observedStatuses.Clear();
+
+        plugin.SimulateAudioClientDisconnectedForTest(new IOException("Voice WebSocket closed 4006"));
+        await plugin.WaitForRecoveryIdleForTestAsync();
+
+        rejoinCalls.Should().Be(1);
+        observedStatuses.Should().Contain(BridgeStatus.Connecting);
+        plugin.Status.Should().Be(BridgeStatus.Connected);
+        plugin.WantsOutboundAudio.Should().BeTrue();
+
+        plugin.SendOutboundPcm(new float[Bridge.OpusFrameSamplesStereo]);
+        rejoinedStream.Length.Should().Be(encoder.PacketBytes);
+    }
+
+    [Fact]
+    public async Task Rejoin_retries_transient_failures_and_heals_when_voice_returns()
+    {
+        var encoder = new FakeFrameEncoder { FrameSamples = 960, Channels = 2, PacketBytes = 8 };
+        using var initialStream = new MemoryStream();
+        using var healedStream = new MemoryStream();
+
+        int attempts = 0;
+        var plugin = NewFastRecoveryBridge();
+        plugin.ConfigureRecoveryForTest(
+            rejoinVoiceAsync: _ =>
+            {
+                attempts++;
+                if (attempts < 3) throw new TimeoutException("Voice handshake timed out");
+                return Task.FromResult<Stream>(healedStream);
+            });
+        plugin.ConfigureOutboundForTest(encoder, initialStream);
+
+        plugin.SimulateAudioClientDisconnectedForTest(new IOException("Network hiccup"));
+        await plugin.WaitForRecoveryIdleForTestAsync();
+
+        attempts.Should().Be(3);
+        plugin.Status.Should().Be(BridgeStatus.Connected);
+        plugin.WantsOutboundAudio.Should().BeTrue();
+        plugin.LastError.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task Exhausted_rejoin_attempts_transition_honestly_to_failed()
+    {
+        var encoder = new FakeFrameEncoder { FrameSamples = 960, Channels = 2, PacketBytes = 8 };
+        using var initialStream = new MemoryStream();
+
+        int attempts = 0;
+        var plugin = NewFastRecoveryBridge();
+        plugin.ConfigureRecoveryForTest(
+            rejoinVoiceAsync: _ =>
+            {
+                attempts++;
+                throw new InvalidOperationException("No permission to connect");
+            });
+        plugin.ConfigureOutboundForTest(encoder, initialStream);
+
+        plugin.SimulateAudioClientDisconnectedForTest(new IOException("Kicked"));
+        await plugin.WaitForRecoveryIdleForTestAsync();
+
+        attempts.Should().Be(3);
+        plugin.Status.Should().Be(BridgeStatus.Failed);
+        plugin.WantsOutboundAudio.Should().BeFalse();
+        plugin.LastError.Should().BeOfType<InvalidOperationException>();
+        plugin.StatusDetail.Should().Contain("No permission to connect");
+    }
+
+    [Fact]
+    public async Task Watchdog_detects_silent_unhealthy_voice_and_triggers_rejoin()
+    {
+        var encoder = new FakeFrameEncoder { FrameSamples = 960, Channels = 2, PacketBytes = 8 };
+        using var initialStream = new MemoryStream();
+        using var healedStream = new MemoryStream();
+
+        bool voiceHealthy = false;
+        int rejoinCalls = 0;
+
+        var plugin = NewFastRecoveryBridge();
+        plugin.ConfigureRecoveryForTest(
+            rejoinVoiceAsync: _ =>
+            {
+                rejoinCalls++;
+                voiceHealthy = true;
+                return Task.FromResult<Stream>(healedStream);
+            },
+            checkVoiceHealth: () => voiceHealthy
+                ? (true, null)
+                : (false, "No voice heartbeat ACK for over 90s"));
+        plugin.ConfigureOutboundForTest(encoder, initialStream);
+
+        plugin.EvaluateVoiceHealthOnce();
+        await plugin.WaitForRecoveryIdleForTestAsync();
+
+        rejoinCalls.Should().Be(1);
+        plugin.Status.Should().Be(BridgeStatus.Connected);
+        plugin.WantsOutboundAudio.Should().BeTrue();
+
+        // Subsequent check sees healthy voice and does not rejoin again.
+        plugin.EvaluateVoiceHealthOnce();
+        await plugin.WaitForRecoveryIdleForTestAsync();
+        rejoinCalls.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task Gateway_disconnect_pauses_outbound_and_rejoins_when_gateway_returns()
+    {
+        var encoder = new FakeFrameEncoder { FrameSamples = 960, Channels = 2, PacketBytes = 8 };
+        using var initialStream = new MemoryStream();
+        using var healedStream = new MemoryStream();
+
+        int rejoinCalls = 0;
+        var plugin = NewFastRecoveryBridge();
+        plugin.ConfigureRecoveryForTest(
+            rejoinVoiceAsync: _ =>
+            {
+                rejoinCalls++;
+                return Task.FromResult<Stream>(healedStream);
+            });
+        plugin.ConfigureOutboundForTest(encoder, initialStream);
+
+        await plugin.SimulateGatewayDisconnectedForTest(new IOException("Gateway dropped"));
+        plugin.WantsOutboundAudio.Should().BeFalse();
+        plugin.Status.Should().Be(BridgeStatus.Connecting);
+
+        // Rejoin should wait until gateway actually reconnects.
+        await Task.Delay(40, TestContext.Current.CancellationToken);
+        rejoinCalls.Should().Be(0);
+
+        await plugin.SimulateGatewayConnectedForTest();
+        await plugin.WaitForRecoveryIdleForTestAsync();
+
+        rejoinCalls.Should().Be(1);
+        plugin.Status.Should().Be(BridgeStatus.Connected);
+        plugin.WantsOutboundAudio.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Transient_single_write_error_drops_frame_without_rebuilding_but_consecutive_errors_trigger_recovery()
+    {
+        var encoder = new FakeFrameEncoder { FrameSamples = 960, Channels = 2, PacketBytes = 8 };
+        using var flakyStream = new FlakyWriteStream { FailuresRemaining = 1 };
+        using var healedStream = new MemoryStream();
+
+        int rebuildCalls = 0;
+        var plugin = NewFastRecoveryBridge();
+        plugin.ConfigureRecoveryForTest(
+            rebuildStreamAsync: _ =>
+            {
+                rebuildCalls++;
+                return Task.FromResult<Stream?>(healedStream);
+            });
+        plugin.ConfigureOutboundForTest(encoder, flakyStream);
+
+        // One transient error followed by a successful frame → stays on same stream.
+        plugin.SendOutboundPcm(new float[Bridge.OpusFrameSamplesStereo * 2]);
+        await plugin.WaitForRecoveryIdleForTestAsync();
+        rebuildCalls.Should().Be(0);
+        flakyStream.WrittenBytes.Should().Be(encoder.PacketBytes);
+
+        // Three consecutive write errors → triggers automatic stream rebuild.
+        flakyStream.FailuresRemaining = 10;
+        plugin.SendOutboundPcm(new float[Bridge.OpusFrameSamplesStereo * 3]);
+        await plugin.WaitForRecoveryIdleForTestAsync();
+
+        rebuildCalls.Should().Be(1);
+        plugin.Status.Should().Be(BridgeStatus.Connected);
+        plugin.SendOutboundPcm(new float[Bridge.OpusFrameSamplesStereo]);
+        healedStream.Length.Should().Be(encoder.PacketBytes);
+    }
+
+    [Fact]
+    public async Task DisconnectAsync_completes_quickly_even_when_stream_flush_hangs()
+    {
+        var encoder = new FakeFrameEncoder { FrameSamples = 960, Channels = 2, PacketBytes = 8 };
+        using var hungStream = new HangingWriteStream();
+
+        var plugin = NewFastRecoveryBridge();
+        plugin.ConfigureOutboundForTest(encoder, hungStream);
+
+        // FlushAsync on hungStream blocks forever unless bounded by FlushTimeout.
+        var disconnectTask = plugin.DisconnectAsync();
+        var completed = await Task.WhenAny(
+            disconnectTask,
+            Task.Delay(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken));
+
+        completed.Should().Be(disconnectTask);
+        await disconnectTask;
+        plugin.Status.Should().Be(BridgeStatus.Disconnected);
+        plugin.WantsOutboundAudio.Should().BeFalse();
+        hungStream.Disposed.Should().BeTrue();
+    }
+}
